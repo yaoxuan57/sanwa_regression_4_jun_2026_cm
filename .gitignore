@@ -1,0 +1,29 @@
+# IDE
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Training outputs
+checkpoints/
+lightning_logs/
+*.pt
+*.pth
+*.ckpt
+
+# Data and logs
+*.parquet
+*.csv
+*.log
+wandb/
+
+# OS and env
+.DS_Store
+Thumbs.db
+.env
+.env.*
