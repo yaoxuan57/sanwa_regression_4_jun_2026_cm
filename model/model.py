@@ -6,6 +6,7 @@ from einops import rearrange
 from timm.models.layers import DropPath
 
 from .Transformer_utils import FullAttention, AttentionLayer, Encoder, EncoderLayer, random_masking
+from .mlp_regressor import MLPHead
 
 
 # ------------ AUGMENTATIONS for Contrastive learning -------------------
@@ -86,8 +87,15 @@ class Transformer_bkbone(L.LightningModule):
         self.input_layer = nn.Linear(args.patch_size, args.embed_dim)
         self.pretrain_head = nn.Linear(args.embed_dim, args.patch_size)
 
-        # Classifier head
-        self.head = nn.Linear(args.embed_dim, args.num_classes)
+        # Task head: single linear layer (default) or notebook-style MLP on pooled encoder features.
+        if getattr(args, "regression_head", "linear") == "mlp":
+            self.head = MLPHead(
+                args.embed_dim,
+                args.num_classes,
+                dropout=getattr(args, "mlp_dropout", 0.1),
+            )
+        else:
+            self.head = nn.Linear(args.embed_dim, args.num_classes)
 
     def forward(self, x):
         x_patch = self.patch_embed(x)
@@ -152,9 +160,9 @@ class Transformer_bkbone(L.LightningModule):
         return loss
 
     def predict(self, features):
-        features_flat = features.mean(1)  # --> [batch, dimension]
-        predictions = self.head(features_flat).squeeze()   # [batch, dimension] --> [batch, num_classes]
-        return predictions
+        features_flat = features.mean(1)  # [batch, embed_dim]
+        # Do not squeeze: batch=1 with multi-target output would become (num_classes,) not (1, num_classes).
+        return self.head(features_flat)
 
     # def pretrain(self, x):
     #     """

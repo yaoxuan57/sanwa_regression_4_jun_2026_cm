@@ -1,0 +1,19 @@
+{
+  "seed": 4202,
+  "n_rows": 4000,
+  "train_rows": 2611,
+  "val_rows": 668,
+  "test_rows": 721,
+  "notebook_train_rows": 3279,
+  "notebook_test_rows": 721,
+  "train_ratio": 0.65275,
+  "val_ratio": 0.167,
+  "test_ratio": 0.18025,
+  "split_csv": "split_indices_balanced_seed4202.csv",
+  "split_method": "propagated_from_unbalanced",
+  "note": "notebook uses notebook_train_indices (=train+val) and notebook_test_indices (same test rows as fine_tune)",
+  "cavity": 2,
+  "data_file": "cavity_2_balanced.xlsx",
+  "source_split": "split_indices_seed4202.csv",
+  "source_data_file": "cavity_2.xlsx"
+}

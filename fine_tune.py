@@ -12,13 +12,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 # import matplotlib
 # matplotlib.use('Qt5Agg')
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, mean_absolute_error, mean_squared_error, r2_score
 from torchmetrics import MetricCollection
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, TQDMProgressBar
 from torchmetrics.classification import Accuracy, MulticlassF1Score, MulticlassConfusionMatrix
-from torchmetrics.regression import MeanSquaredError
+from torchmetrics.regression import MeanSquaredError, MeanAbsoluteError
 from datalaoders.train_dataloader import get_datasets
 from model.model import Transformer_bkbone
+from model.mlp_regressor import MLPRegressor
 from utils import save_copy_of_files, str2bool, get_rul_report, scoring_function_v2
 
 # ==================== Model Wrapper ====================
@@ -26,11 +27,19 @@ class Model(pl.LightningModule):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self.model = Transformer_bkbone(args)
+        if getattr(args, "model_arch", "transformer") == "mlp":
+            n_inputs = args.num_channels
+            n_outputs = args.num_classes
+            self.model = MLPRegressor(n_inputs, n_outputs, dropout=args.mlp_dropout)
+        else:
+            self.model = Transformer_bkbone(args)
         if args.task_type == 'FD':
             self.loss_fn = torch.nn.CrossEntropyLoss()
         elif args.task_type == 'RUL':
-            self.loss_fn = torch.nn.MSELoss()
+            if getattr(args, "regression_loss", "mse") == "mae":
+                self.loss_fn = torch.nn.L1Loss()
+            else:
+                self.loss_fn = torch.nn.MSELoss()
         if args.task_type == 'FD':
             self.train_metrics = MetricCollection({
                 "acc": Accuracy(task="multiclass", num_classes=args.num_classes),
@@ -43,13 +52,15 @@ class Model(pl.LightningModule):
             self.test_f1 = MulticlassF1Score(num_classes=args.num_classes, average="macro")
             self.confusion_matrix = MulticlassConfusionMatrix(num_classes=args.num_classes)
         elif args.task_type == 'RUL':
-            self.train_metrics = MetricCollection({
-                "rmse": MeanSquaredError(squared=False)
-            })
-            self.val_metrics = MetricCollection({
-                "rmse": MeanSquaredError(squared=False)
-            })
-            self.test_rmse = MeanSquaredError(squared=False)
+            if getattr(args, "regression_loss", "mse") == "mae":
+                metric = MeanAbsoluteError()
+                self.regression_metric_name = "mae"
+            else:
+                metric = MeanSquaredError(squared=False)
+                self.regression_metric_name = "rmse"
+            self.train_metrics = MetricCollection({self.regression_metric_name: metric})
+            self.val_metrics = MetricCollection({self.regression_metric_name: metric})
+            self.test_metric = metric
 
 
 
@@ -64,13 +75,35 @@ class Model(pl.LightningModule):
         self.val_preds_epoch = []
         self.val_targets_epoch = []
         self.val_rmse_per_var_history = []
+        self.test_raw_targets_rows = []
 
     def forward(self, x):
+        if getattr(self.args, "model_arch", "transformer") == "mlp":
+            return self.model(x)
         return self.model(x)
 
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.args.lr, weight_decay=self.args.wt_decay)
+    def _predict_rul(self, x):
+        if getattr(self.args, "model_arch", "transformer") == "mlp":
+            return self.model(x)
+        feats = self(x)
+        return self.model.predict(feats)
 
+    def _denormalize_predictions(self, arr):
+        if getattr(self.args, "target_normalize", "none") != "standard":
+            return arr
+        arr = np.asarray(arr, dtype=np.float32)
+        mean = np.asarray(self.args.target_norm_mean, dtype=np.float32).reshape(-1)
+        std = np.asarray(self.args.target_norm_std, dtype=np.float32).reshape(-1)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, mean.shape[0])
+        return arr * std + mean
+
+    def configure_optimizers(self):
+        if getattr(self.args, "model_arch", "transformer") == "mlp":
+            optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr, weight_decay=self.args.wt_decay)
+            return optimizer
+
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.args.lr, weight_decay=self.args.wt_decay)
         scheduler = {
             'scheduler': self.get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=self.num_warmup_steps,
                                                               num_training_steps=self.total_steps),
@@ -121,12 +154,18 @@ class Model(pl.LightningModule):
             preds = torch.argmax(class_logits, dim=1)
 
         elif self.args.task_type == "RUL":
-            feats = self(x)
-            preds = self.model.predict(feats).float()
+            preds = self._predict_rul(x).float()
             y = y.float()
 
             # Normalize to [B, D] so scalar and multi-target regression share one path.
-            preds = preds.view(preds.size(0), -1) if preds.ndim > 1 else preds.unsqueeze(-1)
+            if preds.ndim == 1:
+                batch_size = y.shape[0] if y.ndim > 1 else 1
+                if batch_size == 1 and preds.numel() > 1:
+                    preds = preds.unsqueeze(0)
+                else:
+                    preds = preds.unsqueeze(-1)
+            else:
+                preds = preds.view(preds.size(0), -1)
             y = self._prepare_rul_targets(y)
 
             if preds.size(1) != y.size(1):
@@ -163,11 +202,18 @@ class Model(pl.LightningModule):
                 self.log("test_accuracy", acc)
 
             else:
-                self.test_rmse.update(preds, y)
-                self.test_preds.extend(preds.detach().cpu().reshape(-1).numpy())
-                self.test_targets.extend(y.detach().cpu().reshape(-1).numpy())
-                self.test_preds_rows.append(preds.detach().cpu().numpy())
-                self.test_targets_rows.append(y.detach().cpu().numpy())
+                preds_np = preds.detach().cpu().numpy()
+                y_np = y.detach().cpu().numpy()
+                preds_denorm = self._denormalize_predictions(preds_np)
+                y_denorm = self._denormalize_predictions(y_np)
+                self.test_metric.update(
+                    torch.tensor(preds_denorm, device=preds.device),
+                    torch.tensor(y_denorm, device=y.device),
+                )
+                self.test_preds.extend(preds_denorm.reshape(-1))
+                self.test_targets.extend(y_denorm.reshape(-1))
+                self.test_preds_rows.append(preds_denorm)
+                self.test_targets_rows.append(y_denorm)
                 if self.args.rul_target_mode_effective == "single":
                     score = scoring_function_v2(np.array(self.test_preds), np.array(self.test_targets))
                     self.log("test_score", score)
@@ -235,13 +281,25 @@ class Model(pl.LightningModule):
                 f.write(report)
 
         elif self.args.task_type == 'RUL':
-            rmse = self.test_rmse.compute()
-            self.log("test_rmse", rmse)
-            self.test_rmse.reset()
+            test_metric_val = self.test_metric.compute()
+            metric_name = self.regression_metric_name
+            self.log(f"test_{metric_name}", test_metric_val)
+            self.test_metric.reset()
+            rmse = test_metric_val if metric_name == "rmse" else None
 
             test_preds_arr = np.array(self.test_preds, dtype=np.float32)
             test_targets_arr = np.array(self.test_targets, dtype=np.float32)
-            mae = float(np.mean(np.abs(test_preds_arr - test_targets_arr)))
+
+            if len(self.test_preds_rows) > 0:
+                preds_2d = np.concatenate(self.test_preds_rows, axis=0)
+                targets_2d = np.concatenate(self.test_targets_rows, axis=0)
+            else:
+                preds_2d = test_preds_arr.reshape(-1, 1)
+                targets_2d = test_targets_arr.reshape(-1, 1)
+
+            metrics_table, metrics_rows = self._build_rul_metrics_table(preds_2d, targets_2d)
+            overall_metrics = next(row for row in metrics_rows if row["output"] == "OVERALL (macro avg)")
+            mae = overall_metrics["MAE"]
 
             # Scoring function is only defined for scalar RUL.
             score = None
@@ -249,74 +307,66 @@ class Model(pl.LightningModule):
                 score = scoring_function_v2(test_preds_arr, test_targets_arr)
                 self.log("test_score", score)
             self.log("test_mae", mae)
+            self.log("test_rmse", overall_metrics["RMSE"])
+            self.log("test_mse", overall_metrics["MSE"])
 
             # Save flattened predictions and targets.
             np.save(f"{self.args.ckpt_dir}/test_preds.npy", test_preds_arr)
             np.save(f"{self.args.ckpt_dir}/test_targets.npy", test_targets_arr)
-            if len(self.test_preds_rows) > 0:
-                preds_2d = np.concatenate(self.test_preds_rows, axis=0)
-                targets_2d = np.concatenate(self.test_targets_rows, axis=0)
-                np.save(f"{self.args.ckpt_dir}/test_preds_2d.npy", preds_2d)
-                np.save(f"{self.args.ckpt_dir}/test_targets_2d.npy", targets_2d)
-                self._save_selected_test_window_visuals(preds_2d, targets_2d)
+            np.save(f"{self.args.ckpt_dir}/test_preds_2d.npy", preds_2d)
+            np.save(f"{self.args.ckpt_dir}/test_targets_2d.npy", targets_2d)
+            self._save_rul_metrics_csv(metrics_rows)
+            if self.args.rul_target_mode_effective == "multi" and preds_2d.ndim == 2 and preds_2d.shape[1] > 1:
+                self._save_multi_target_scatter_plot(preds_2d, targets_2d, float(test_metric_val))
+            self._save_selected_test_window_visuals(preds_2d, targets_2d)
             self._save_val_rmse_over_epochs_plot()
+
             report = f"""=== RUL Prediction Report ===
-            Evaluation Metrics:
-            - RMSE: {rmse:.8f}
-            - MAE: {mae:.8f}
-            - Target Mode: {self.args.rul_target_mode_effective}
-            - Output Dim: {self.args.num_classes}
-            """
+Target Mode: {self.args.rul_target_mode_effective}
+Output Dim: {self.args.num_classes}
+Model Arch: {getattr(self.args, 'model_arch', 'transformer')}
+Regression Head: {getattr(self.args, 'regression_head', 'linear')}
+Regression Loss: {getattr(self.args, 'regression_loss', 'mse')}
+Training Metric ({metric_name.upper()}): {float(test_metric_val):.8f}
+"""
             if score is not None:
-                report += f"- Score: {score:.8f}\n"
+                report += f"RUL Score: {score:.8f}\n"
             else:
-                report += "- Score: N/A (multi-target mode)\n"
+                report += "RUL Score: N/A (multi-target mode)\n"
 
             report += f"""
+=== Per-target and Overall Metrics (test set) ===
+{metrics_table}
 
-            Prediction Statistics:
-            - Min True RUL: {np.min(test_targets_arr):.2f}
-            - Max True RUL: {np.max(test_targets_arr):.2f}
-            - Mean True RUL: {np.mean(test_targets_arr):.2f}
-            - Std True RUL: {np.std(test_targets_arr):.2f}
+Saved metrics CSV: regression_metrics.csv
 
-            - Min Predicted RUL: {np.min(test_preds_arr):.2f}
-            - Max Predicted RUL: {np.max(test_preds_arr):.2f}
-            - Mean Predicted RUL: {np.mean(test_preds_arr):.2f}
-            - Std Predicted RUL: {np.std(test_preds_arr):.2f}
+=== Prediction Statistics (flattened test values) ===
+True  -> min: {np.min(test_targets_arr):.4f}, max: {np.max(test_targets_arr):.4f}, mean: {np.mean(test_targets_arr):.4f}
+Pred  -> min: {np.min(test_preds_arr):.4f}, max: {np.max(test_preds_arr):.4f}, mean: {np.mean(test_preds_arr):.4f}
 
-            First 10 predictions (True, Predicted):
-            """
+First 10 flattened predictions (True, Predicted):
+"""
             for i in range(min(10, len(test_targets_arr))):
                 report += f"{test_targets_arr[i]:.4f}, {test_preds_arr[i]:.4f}\n"
-
-            if self.args.rul_target_mode_effective == "multi" and self.rul_label_shape is not None:
-                try:
-                    per_dim_rmse = np.sqrt(np.mean((preds_2d.reshape(-1, *self.rul_label_shape) -
-                                                   targets_2d.reshape(-1, *self.rul_label_shape)) ** 2, axis=0))
-                    report += "\nPer-target RMSE matrix (channels x horizon or original label layout):\n"
-                    report += np.array2string(per_dim_rmse, precision=4)
-                    report += "\n"
-                except Exception:
-                    pass
 
             print(report)
             with open(f"{self.args.ckpt_dir}/rul_report.txt", "w") as f:
                 f.write(report)
-            # Plot predictions vs targets
-            plt.figure(figsize=(10, 6))
-            plt.scatter(test_targets_arr, test_preds_arr, alpha=0.5)
-            plt.plot([min(test_targets_arr), max(test_targets_arr)],
-                     [min(test_targets_arr), max(test_targets_arr)], 'r--')
-            plt.xlabel('True RUL')
-            plt.ylabel('Predicted RUL')
-            title = f'RUL Prediction\nRMSE: {rmse:.2f}, MAE: {mae:.2f}'
-            if score is not None:
-                title += f', Score: {score:.2f}'
-            plt.title(title)
-            plt.tight_layout()
-            plt.savefig(f"{self.args.ckpt_dir}/rul_prediction.png", bbox_inches="tight")
-            plt.close()
+            # Single-target only: one combined scatter. Multi-target uses per-output grid plot.
+            if not (self.args.rul_target_mode_effective == "multi" and len(self.test_preds_rows) > 0):
+                plt.figure(figsize=(10, 6))
+                plt.scatter(test_targets_arr, test_preds_arr, alpha=0.5)
+                plt.plot([min(test_targets_arr), max(test_targets_arr)],
+                         [min(test_targets_arr), max(test_targets_arr)], 'r--')
+                plt.xlabel('True RUL')
+                plt.ylabel('Predicted RUL')
+                title = f'RUL Prediction\nRMSE: {overall_metrics["RMSE"]:.2f}, MAE: {mae:.2f}'
+                if score is not None:
+                    title += f', Score: {score:.2f}'
+                plt.title(title)
+                plt.tight_layout()
+                plt.savefig(f"{self.args.ckpt_dir}/rul_prediction.png", bbox_inches="tight")
+                plt.close()
 
         self.test_preds = []
         self.test_targets = []
@@ -363,6 +413,10 @@ class Model(pl.LightningModule):
 
     def _save_selected_test_window_visuals(self, preds_2d, targets_2d):
         if self.rul_label_shape is None and self.args.rul_target_mode_effective != "single":
+            return
+
+        # Tabular / single-step regression has no forecast horizon — skip time-step plots.
+        if self.rul_label_shape is not None and len(self.rul_label_shape) == 1:
             return
 
         if self.args.rul_target_mode_effective == "single":
@@ -439,6 +493,136 @@ class Model(pl.LightningModule):
                 plt.savefig(var_dir / f"window_{int(win_idx)}.png", bbox_inches="tight")
                 plt.close()
 
+    def _compute_regression_metrics(self, actual, predicted):
+        actual = np.asarray(actual, dtype=np.float64).reshape(-1)
+        predicted = np.asarray(predicted, dtype=np.float64).reshape(-1)
+        mae = float(mean_absolute_error(actual, predicted))
+        mse = float(mean_squared_error(actual, predicted))
+        rmse = float(np.sqrt(mse))
+        denom = np.maximum(np.abs(actual), 1e-8)
+        mape = float(np.mean(np.abs(actual - predicted) / denom) * 100.0)
+        r2 = float(r2_score(actual, predicted))
+        return {"MAE": mae, "MSE": mse, "RMSE": rmse, "MAPE": mape, "R2": r2}
+
+    def _build_rul_metrics_table(self, preds_2d, targets_2d):
+        preds_2d = np.asarray(preds_2d, dtype=np.float64)
+        targets_2d = np.asarray(targets_2d, dtype=np.float64)
+        if preds_2d.ndim == 1:
+            preds_2d = preds_2d.reshape(-1, 1)
+            targets_2d = targets_2d.reshape(-1, 1)
+
+        num_targets = preds_2d.shape[1]
+        target_names = self._get_rul_target_names(num_targets)
+        metric_keys = ["MAE", "MSE", "RMSE", "MAPE", "R2"]
+
+        rows = []
+        for idx in range(num_targets):
+            row = {"output": target_names[idx]}
+            row.update(self._compute_regression_metrics(targets_2d[:, idx], preds_2d[:, idx]))
+            rows.append(row)
+
+        per_target_rows = rows.copy()
+        overall_macro = {"output": "OVERALL (macro avg)"}
+        for key in metric_keys:
+            overall_macro[key] = float(np.mean([row[key] for row in per_target_rows]))
+        rows.append(overall_macro)
+
+        overall_flat = {"output": "OVERALL (all samples)"}
+        overall_flat.update(self._compute_regression_metrics(targets_2d, preds_2d))
+        # Pooled R2 is dominated by large-scale targets; report macro-averaged R2 instead.
+        overall_flat["R2"] = overall_macro["R2"]
+        rows.append(overall_flat)
+
+        header = ["output"] + metric_keys
+        col_widths = {key: len(key) for key in header}
+        col_widths["output"] = max(len("output"), max(len(row["output"]) for row in rows))
+        for key in metric_keys:
+            col_widths[key] = max(len(key), max(len(f"{row[key]:.6f}") for row in rows))
+
+        def fmt_header():
+            cells = ["output".ljust(col_widths["output"])]
+            for key in metric_keys:
+                cells.append(key.rjust(col_widths[key]))
+            return "  ".join(cells)
+
+        def fmt_row(row):
+            cells = [row["output"].ljust(col_widths["output"])]
+            for key in metric_keys:
+                cells.append(f"{row[key]:>{col_widths[key]}.6f}")
+            return "  ".join(cells)
+
+        lines = [
+            fmt_header(),
+            "  ".join("-" * col_widths[key] for key in header),
+        ]
+        lines.extend(fmt_row(row) for row in rows)
+        return "\n".join(lines), rows
+
+    def _save_rul_metrics_csv(self, rows):
+        metric_keys = ["output", "MAE", "MSE", "RMSE", "MAPE", "R2"]
+        csv_path = f"{self.args.ckpt_dir}/regression_metrics.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=metric_keys)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row[key] for key in metric_keys})
+
+    def _get_rul_target_names(self, num_targets):
+        names = getattr(self.args, "rul_target_names", None)
+        if names is None and "trolley_regression" in getattr(self.args, "data_id", ""):
+            names = TROLLEY_TARGET_NAMES
+        if names is not None:
+            if len(names) != num_targets:
+                print(
+                    f"Warning: rul_target_names has {len(names)} entries but model has "
+                    f"{num_targets} targets. Falling back to generic names."
+                )
+                return [f"target{i}" for i in range(num_targets)]
+            return names
+        return [f"target{i}" for i in range(num_targets)]
+
+    def _save_multi_target_scatter_plot(self, preds_2d, targets_2d, rmse):
+        num_targets = preds_2d.shape[1]
+        target_names = self._get_rul_target_names(num_targets)
+        if num_targets == 6:
+            n_rows, n_cols, figsize = 2, 3, (14, 9)
+        else:
+            n_cols = 3
+            n_rows = int(np.ceil(num_targets / n_cols))
+            figsize = (5 * n_cols, 4 * n_rows)
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+        axes = np.atleast_1d(axes).ravel()
+
+        for idx in range(num_targets):
+            ax = axes[idx]
+            actual = targets_2d[:, idx]
+            predicted = preds_2d[:, idx]
+
+            lo = min(actual.min(), predicted.min())
+            hi = max(actual.max(), predicted.max())
+            pad = 0.05 * (hi - lo) if hi > lo else 0.01
+            lim = (lo - pad, hi + pad)
+
+            ax.scatter(actual, predicted, alpha=0.7, edgecolors="k", linewidths=0.3, s=40)
+            ax.plot(lim, lim, "r--", lw=1.5, label="y = x")
+            ax.set_xlim(lim)
+            ax.set_ylim(lim)
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_title(target_names[idx])
+            ax.set_xlabel("Actual")
+            ax.set_ylabel("Predicted")
+            ax.legend(loc="upper left", fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+        for idx in range(num_targets, len(axes)):
+            axes[idx].axis("off")
+
+        fig.suptitle("Actual vs Predicted (test set)", fontsize=14, y=1.02)
+        fig.tight_layout()
+        fig.savefig(f"{self.args.ckpt_dir}/actual_vs_predicted_test.png", bbox_inches="tight")
+        plt.close(fig)
+
     def _save_val_rmse_over_epochs_plot(self):
         if len(self.val_rmse_per_var_history) == 0:
             return
@@ -466,7 +650,9 @@ class Model(pl.LightningModule):
 def construct_experiment_dir(args):
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     run_description = "FT" if args.load_from_pretrained else "Supervised"
-    run_description += f"_{args.model_type}"
+    run_description += f"_{getattr(args, 'model_arch', 'transformer')}_{args.model_type}"
+    if getattr(args, "model_arch", "transformer") == "transformer" and getattr(args, "regression_head", "linear") == "mlp":
+        run_description += "_mlphead"
     run_description += f"_{args.data_id}_from{args.pretraining_epoch_id}_{args.model_id}"
     run_description += f"_bs{args.batch_size}_lr{args.lr}_seed{args.random_seed}_{timestamp}"
     return run_description
@@ -488,12 +674,46 @@ def plot_metrics(metrics, ckpt_dir, task_type):
         plt.legend()
         plt.title("Accuracy Curve")
     elif task_type == 'RUL':
-        plt.plot(metrics["train_rmse"], label="Train RMSE")
-        plt.plot(metrics["val_rmse"], label="Val RMSE")
+        if "train_mae" in metrics and len(metrics["train_mae"]) > 0:
+            plt.plot(metrics["train_mae"], label="Train MAE")
+            plt.plot(metrics["val_mae"], label="Val MAE")
+            plt.title("MAE Curve")
+        else:
+            plt.plot(metrics["train_rmse"], label="Train RMSE")
+            plt.plot(metrics["val_rmse"], label="Val RMSE")
+            plt.title("RMSE Curve")
         plt.legend()
-        plt.title("RMSE Curve")
     plt.tight_layout()
     plt.savefig(f"{ckpt_dir}/performance_metric.png", bbox_inches="tight")
+
+
+class InMemoryBestWeightsCallback(pl.Callback):
+    """Track best validation weights in RAM when disk checkpoints are disabled."""
+
+    def __init__(self, monitor, mode="min"):
+        super().__init__()
+        self.monitor = monitor
+        self.mode = mode
+        self.best_score = float("inf") if mode == "min" else float("-inf")
+        self.best_state_dict = None
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if self.monitor not in trainer.callback_metrics:
+            return
+        current = trainer.callback_metrics[self.monitor].item()
+        improved = current < self.best_score if self.mode == "min" else current > self.best_score
+        if improved:
+            self.best_score = current
+            self.best_state_dict = {k: v.detach().cpu().clone() for k, v in pl_module.state_dict().items()}
+
+    def on_train_end(self, trainer, pl_module):
+        if self.best_state_dict is None:
+            return
+        device = next(pl_module.parameters()).device
+        pl_module.load_state_dict(
+            {k: v.to(device) for k, v in self.best_state_dict.items()}
+        )
+        print(f"Restored in-memory best weights ({self.monitor}={self.best_score:.6f})")
 
 
 class MetricTrackerCallback(pl.Callback):
@@ -504,21 +724,28 @@ class MetricTrackerCallback(pl.Callback):
         if task_type == 'FD':
             self.accuracies = {"train_acc": [], "val_acc": []}
         elif task_type == 'RUL':
-            self.rmses = {"train_rmse": [], "val_rmse": []}
+            self.regression_metric_name = "rmse"
+            self.rmses = {"train_rmse": [], "val_rmse": [], "train_mae": [], "val_mae": []}
 
     def on_validation_epoch_end(self, trainer, pl_module):
         self.losses["val_loss"].append(trainer.callback_metrics["val_loss"].item())
         if self.task_type == 'FD':
             self.accuracies["val_acc"].append(trainer.callback_metrics["val_acc"].item())
         elif self.task_type == 'RUL':
-            self.rmses["val_rmse"].append(trainer.callback_metrics["val_rmse"].item())
+            metric_name = getattr(pl_module, "regression_metric_name", "rmse")
+            key = f"val_{metric_name}"
+            if key in trainer.callback_metrics:
+                self.rmses[key].append(trainer.callback_metrics[key].item())
 
     def on_train_epoch_end(self, trainer, pl_module):
         self.losses["train_loss"].append(trainer.callback_metrics["train_loss"].item())
         if self.task_type == 'FD':
             self.accuracies["train_acc"].append(trainer.callback_metrics["train_acc"].item())
         elif self.task_type == 'RUL':
-            self.rmses["train_rmse"].append(trainer.callback_metrics["train_rmse"].item())
+            metric_name = getattr(pl_module, "regression_metric_name", "rmse")
+            key = f"train_{metric_name}"
+            if key in trainer.callback_metrics:
+                self.rmses[key].append(trainer.callback_metrics[key].item())
 
 # ==================== Main ====================
 def main(args):
@@ -546,9 +773,16 @@ def main(args):
         print(f"RUL target mode: {args.rul_target_mode_effective}")
         if args.rul_target_mode_effective == "single":
             print(f"RUL single target index (flattened): {args.rul_single_target_index}")
-    args.seq_len = train_loader.dataset.x_data.shape[-1]
-    args.num_channels = train_loader.dataset.x_data.shape[1]
+    if getattr(args, "model_arch", "transformer") == "mlp":
+        args.num_channels = train_loader.dataset.x_data.shape[1]
+        args.seq_len = 1
+    else:
+        args.seq_len = train_loader.dataset.x_data.shape[-1]
+        args.num_channels = train_loader.dataset.x_data.shape[1]
     args.tl_length = len(train_loader)
+    if getattr(args, "target_normalize", "none") == "standard" and hasattr(train_loader.dataset, "target_norm_mean"):
+        args.target_norm_mean = train_loader.dataset.target_norm_mean
+        args.target_norm_std = train_loader.dataset.target_norm_std
 
     # Callbacks
     run_description = construct_experiment_dir(args)
@@ -559,23 +793,30 @@ def main(args):
     os.makedirs(ckpt_dir, exist_ok=True)
 
     # Set monitoring metric based on task type
+    best_weights = None
     if args.task_type == 'FD':
         checkpoint = ModelCheckpoint(monitor="train_f1_epoch", mode="max", save_top_k=1, dirpath=ckpt_dir,
                                      filename="best")
         early_stop = EarlyStopping(monitor="train_f1_epoch", patience=args.patience, mode="max")
     elif args.task_type == 'RUL':
-        checkpoint = ModelCheckpoint(monitor="val_rmse", mode="min", save_top_k=1, dirpath=ckpt_dir, filename="best")
-        early_stop = EarlyStopping(monitor="val_rmse", patience=args.patience, mode="min")
+        # Skip mid-epoch checkpoint writes; they often fail with PermissionError on Desktop/OneDrive.
+        checkpoint = None
+        monitor = f"val_{args.regression_loss}" if args.regression_loss == "mae" else "val_rmse"
+        early_stop = EarlyStopping(monitor=monitor, patience=args.patience, mode="min")
+        best_weights = InMemoryBestWeightsCallback(monitor=monitor, mode="min")
 
     tracker = MetricTrackerCallback(args.task_type)
 
-    save_copy_of_files(checkpoint)
+    if checkpoint is not None:
+        save_copy_of_files(checkpoint)
 
     model = Model(args)
 
     load_map = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
 
     # Optional load pretrained weights
+    if getattr(args, "model_arch", "transformer") == "mlp":
+        args.load_from_pretrained = False
     if args.load_from_pretrained and args.pretrained_model_type != 'mae':
         path = os.path.join(args.pretrained_model_dir, f"pretrain-epoch={args.pretraining_epoch_id}.ckpt")
         checkpoint_data = torch.load(path, map_location=load_map, weights_only=False)
@@ -624,18 +865,39 @@ def main(args):
     else:
         accelerator, devices, precision = "cpu", 1, "32-true"
 
+    callbacks = []
+    if checkpoint is not None:
+        callbacks.append(checkpoint)
+    if best_weights is not None:
+        callbacks.append(best_weights)
+    if early_stop is not None:
+        callbacks.append(early_stop)
+    callbacks.extend([tracker, TQDMProgressBar(refresh_rate=500)])
+
     trainer = pl.Trainer(
         default_root_dir=ckpt_dir,
         max_epochs=args.num_epochs,
-        callbacks=[checkpoint, early_stop, tracker, TQDMProgressBar(refresh_rate=500)],
+        callbacks=callbacks,
         accelerator=accelerator,
         precision=precision,
         devices=devices,
         num_sanity_val_steps=0,
+        log_every_n_steps=max(1, min(50, len(train_loader))),
     )
 
     trainer.fit(model, train_loader, val_loader)
-    trainer.test(model, test_loader, ckpt_path="best")
+
+    final_weights_path = os.path.join(ckpt_dir, "final_state_dict.pt")
+    try:
+        torch.save(model.state_dict(), final_weights_path)
+        print(f"Saved final model weights to {final_weights_path}")
+    except OSError as exc:
+        print(f"Warning: could not save final weights ({exc})")
+
+    if checkpoint is not None:
+        trainer.test(model, test_loader, ckpt_path="best")
+    else:
+        trainer.test(model, test_loader)
 
     if args.task_type == 'FD':
         plot_metrics(
@@ -645,14 +907,18 @@ def main(args):
             args.task_type
         )
     elif args.task_type == 'RUL':
+        metric_name = model.regression_metric_name
         plot_metrics(
             {"train_loss": tracker.losses["train_loss"], "val_loss": tracker.losses["val_loss"],
-             "train_rmse": tracker.rmses["train_rmse"], "val_rmse": tracker.rmses["val_rmse"]},
+             f"train_{metric_name}": tracker.rmses[f"train_{metric_name}"],
+             f"val_{metric_name}": tracker.rmses[f"val_{metric_name}"]},
             args.ckpt_dir,
             args.task_type
         )
 
 def apply_model_config(args):
+    if getattr(args, "model_arch", "transformer") == "mlp":
+        return
     config_map = {
         'tiny':  {'embed_dim': 128, 'heads': 4,  'depth': 4},
         'small': {'embed_dim': 256, 'heads': 8,  'depth': 8},
@@ -663,6 +929,42 @@ def apply_model_config(args):
         setattr(args, k, v)
 
 
+TROLLEY_TARGET_NAMES = [
+    "CSlot_Top_Gap",
+    "CSlot_Length",
+    "CSlot_Bot_Gap",
+    "Latch_Height",
+    "Latch_Length",
+    "Nozzle_Diameter",
+]
+
+
+def apply_trolley_defaults(args):
+    """Apply trolley regression defaults unless the user already set them."""
+    if "trolley_regression" not in getattr(args, "data_id", ""):
+        return
+    if args.rul_target_names is None:
+        args.rul_target_names = TROLLEY_TARGET_NAMES
+    if args.input_normalize == "none":
+        args.input_normalize = "standard"
+    if args.target_normalize == "none":
+        args.target_normalize = "standard"
+
+
+def apply_mlp_notebook_defaults(args):
+    """Match neural_network_regression_M1.ipynb training setup."""
+    if getattr(args, "model_arch", "transformer") != "mlp":
+        return
+    args.num_epochs = 300
+    args.batch_size = 32
+    args.lr = 1e-3
+    args.wt_decay = 1e-5
+    args.mlp_dropout = 0.1
+    args.input_normalize = "standard"
+    args.target_normalize = "standard"
+    args.load_from_pretrained = False
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
@@ -671,9 +973,19 @@ if __name__ == "__main__":
     parser.add_argument('--data_percentage', type=str, default="1")
     parser.add_argument('--model_id', type=str, default="CNC_FT", help= 'CNC_FT or FEMTO_FT')
 
+    parser.add_argument('--model_arch', type=str, default='transformer', choices=['transformer', 'mlp'],
+                        help='transformer: pretrained encoder backbone; mlp: skip encoder, flat 12-dim notebook MLP')
+    parser.add_argument(
+        '--regression_head',
+        type=str,
+        default='linear',
+        choices=['linear', 'mlp'],
+        help='Final layer on transformer pooled features: linear (default) or mlp (notebook 64->32 head)',
+    )
     parser.add_argument('--model_type', type=str, choices=['tiny', 'small', 'base'], default='tiny')
     parser.add_argument('--patch_size', type=int, default=64)
     parser.add_argument('--dropout', type=float, default=0.3)
+    parser.add_argument('--mlp_dropout', type=float, default=0.1, help='Dropout for MLP notebook architecture')
     parser.add_argument('--gpu_id', type=int, default=0)
     parser.add_argument('--use_moe', type=str2bool, default=False, help='[use MoE or default]')
 
@@ -702,7 +1014,37 @@ if __name__ == "__main__":
         default=0,
         help='Flattened index to use when --rul_target_mode single and labels have multiple dimensions'
     )
+    parser.add_argument(
+        '--rul_target_names',
+        type=str,
+        nargs='+',
+        default=None,
+        help='Optional names for multi-target regression outputs (used in plots/reports)'
+    )
+    parser.add_argument(
+        '--input_normalize',
+        type=str,
+        default='none',
+        choices=['none', 'zscore', 'standard'],
+        help='Input normalization: none, zscore, or standard (notebook StandardScaler)'
+    )
+    parser.add_argument(
+        '--target_normalize',
+        type=str,
+        default='none',
+        choices=['none', 'standard'],
+        help='Target normalization: none or standard (notebook StandardScaler on outputs)'
+    )
+    parser.add_argument(
+        '--regression_loss',
+        type=str,
+        default='mae',
+        choices=['mse', 'mae'],
+        help='Regression training loss. Notebook trains with MSE on scaled targets; use mae for MAE loss.'
+    )
     args = parser.parse_args()
+    apply_trolley_defaults(args)
+    apply_mlp_notebook_defaults(args)
     apply_model_config(args)
     main(args)
 
@@ -723,3 +1065,5 @@ if __name__ == "__main__":
 
 # Time Series classification
 # python fine_tune.py --task_type FD --data_path time_series_dataset --data_id taisin_time_series_classification --data_percentage 1 --model_id taisin_cclassification --model_type tiny --pretrained_model_dir pretrained_models/Tiny --pretraining_epoch_id 1 --batch_size 16 --num_epochs 2 --lr 3e-4 --gpu_id 0
+
+# python fine_tune.py --task_type RUL --data_path tabular_dataset --data_id trolley_regression_splits --data_percentage 1 --model_id trolley_multi --rul_target_mode multi --input_normalize zscore --load_from_pretrained True --rul_target_names CSlot_Top_Gap CSlot_Length CSlot_Bot_Gap Latch_Height Latch_Length Nozzle_Diameter

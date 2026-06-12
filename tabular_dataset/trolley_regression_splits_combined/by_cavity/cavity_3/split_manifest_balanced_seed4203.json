@@ -1,0 +1,12 @@
+{
+  "cavity": 3,
+  "seed": 4203,
+  "data_file": "cavity_3_balanced.xlsx",
+  "n_rows": 4000,
+  "split_method": "propagated_from_unbalanced",
+  "source_split": "split_indices_seed4203.csv",
+  "train_rows": 2387,
+  "val_rows": 734,
+  "test_rows": 879,
+  "notebook_train_rows": 3121
+}

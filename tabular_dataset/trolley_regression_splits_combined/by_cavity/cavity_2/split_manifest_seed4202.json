@@ -1,0 +1,15 @@
+{
+  "cavity": 2,
+  "seed": 4202,
+  "data_file": "cavity_2.xlsx",
+  "n_rows": 256,
+  "train_rows": 154,
+  "val_rows": 42,
+  "test_rows": 60,
+  "notebook_train_rows": 196,
+  "train_ratio": 0.6,
+  "val_ratio": 0.2,
+  "test_ratio": 0.2,
+  "split_method": "streaming_random",
+  "split_csv": "split_indices_seed4202.csv"
+}

@@ -15,6 +15,7 @@ lightning_logs/
 *.pt
 *.pth
 *.ckpt
+*.ppt
 
 # Data and logs
 *.parquet
