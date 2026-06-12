@@ -5,10 +5,15 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=36G
 #SBATCH --time=10:00:00
-#SBATCH -J pl_ft
+#SBATCH -J sanwa_ft
 #SBATCH -o ~/logs/%x-%j.out
 
 set -euo pipefail
+
+# ---- User knobs (change per run) ----
+CAVITY="${CAVITY:-1}"                          # 1-8
+RUN_NAME="${RUN_NAME:-cavity_${CAVITY}_balanced_transformer_mlphead}"
+MODEL_ID="${MODEL_ID:-cavity_${CAVITY}_balanced_ft}"
 
 # --- Initialize Environment Modules ---
 if [ -f /etc/profile.d/modules.sh ]; then
@@ -26,49 +31,54 @@ APPTAINER_BIN="$(command -v apptainer || true)"
 [ -z "$APPTAINER_BIN" ] && APPTAINER_BIN="$(command -v singularity || true)"
 [ -z "$APPTAINER_BIN" ] && { echo "FATAL: apptainer/singularity not found"; exit 127; }
 
-# ---- Paths ----
+# ---- Paths (same cluster layout as previous sbatch) ----
 IMAGE="/scratch/prj0000000262/images/pytorch-2.4-cuda12.1.sif"
 [ -f "$IMAGE" ] || { echo "FATAL: image not found: $IMAGE"; exit 2; }
 
 export APPTAINER_CACHEDIR="/scratch/prj0000000262/.apptainer_cache"
 mkdir -p "$APPTAINER_CACHEDIR" "$HOME/logs"
 
-# Repo root (must contain requirements.txt and your python entry script)
-CODE_DIR="$HOME/Taisin_FD/Taisin_FD"
-DATA_DIR="/scratch/prj0000000262"      # adjust as needed
-RUNS_DIR="/scratch/prj0000000262"    # where checkpoints/logs will go
-RUN_NAME="Motor_1_trial_01"   # Alok to change
-mkdir -p "$DATA_DIR" "$RUNS_DIR"
+# Repo on cluster (bound to /workspace inside container)
+CODE_DIR="${CODE_DIR:-$HOME/sanwa_regression_4_jun_2026_cm}"
+RUNS_DIR="${RUNS_DIR:-/scratch/prj0000000262/ngyx/sanwa/runs}"
+mkdir -p "$RUNS_DIR"
 
-# Your python entrypoint file (the script that contains the code you pasted)
-SCRIPT="fine_tune_taisin_motor_3.py"   # <- rename to your actual filename in repo
+SCRIPT="fine_tune.py"
 
-# ---- Args to your script ----
-# Note: this script decides task_type from data_id (FEMTO => RUL else FD)
+# Paths inside container (/workspace = CODE_DIR)
+DATA_PATH="/workspace/tabular_dataset"
+DATA_ID="trolley_regression_splits_combined/by_cavity/cavity_${CAVITY}/balanced"
+PRETRAINED_DIR="/workspace/pretrained_models/Tiny"
+
 EXTRA_ARGS=(
-  --data_path "$DATA_DIR"
-  --data_id "Taisin_PHD_Historical_data"  # ALok to change
+  --task_type RUL
+  --data_path "$DATA_PATH"
+  --data_id "$DATA_ID"
   --data_percentage "1"
-  --model_id "TS_M5"
+  --model_id "$MODEL_ID"
 
-  --model_type "tiny"
+  --model_arch transformer
+  --regression_head mlp
+  --model_type tiny
   --patch_size 64
   --dropout 0.3
   --gpu_id 0
   --use_moe false
 
   --load_from_pretrained true
-  --pretrained_model_dir "/home/users/astar/simt/ngyx/Taisin_FD/Taisin_FD/pretrained_models/Tiny"  # alok to change
+  --pretrained_model_dir "$PRETRAINED_DIR"
   --pretraining_epoch_id 1
-  --pretrained_model_type "normal"
+  --pretrained_model_type normal
 
-  --num_epochs 200
+  --rul_target_mode multi
+  --regression_loss mae
+
+  --num_epochs 600
   --patience 50
-  --batch_size 8
+  --batch_size 16
   --lr 3e-4
   --wt_decay 1e-4
   --random_seed 42
-  --task_type 'FD'
 )
 
 # ---- Logging ----
@@ -77,8 +87,9 @@ echo "[INFO] Job ID: ${SLURM_JOB_ID:-N/A}"
 echo "[INFO] GPUs: ${SLURM_GPUS:-N/A} | STEP_GPUS: ${SLURM_STEP_GPUS:-N/A} | GRES: ${SLURM_GRES:-N/A}"
 echo "[INFO] IMAGE: $IMAGE"
 echo "[INFO] CODE_DIR: $CODE_DIR"
-echo "[INFO] DATA_DIR: $DATA_DIR"
 echo "[INFO] RUNS_DIR: $RUNS_DIR"
+echo "[INFO] CAVITY: $CAVITY | RUN_NAME: $RUN_NAME"
+echo "[INFO] DATA_ID: $DATA_ID"
 echo "[ENV ] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi || true
 
@@ -87,7 +98,7 @@ cd "$CODE_DIR"
 RUN_DIR="$RUNS_DIR/$RUN_NAME"
 mkdir -p "$RUN_DIR"
 git rev-parse --short HEAD > "$RUN_DIR/git_commit.txt" 2>/dev/null || echo "no-git" > "$RUN_DIR/git_commit.txt"
-printf "SLURM_JOB_ID=%s\nHOSTNAME=%s\n" "${SLURM_JOB_ID:-N/A}" "$(hostname)" > "$RUN_DIR/run_env.txt"
+printf "SLURM_JOB_ID=%s\nHOSTNAME=%s\nCAVITY=%s\n" "${SLURM_JOB_ID:-N/A}" "$(hostname)" "$CAVITY" > "$RUN_DIR/run_env.txt"
 
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
@@ -96,11 +107,10 @@ export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 BIND_OPTS="--bind $CODE_DIR:/workspace --bind /scratch:/scratch --bind $HOME/logs:$HOME/logs"
 
 # ---- Reusable venv & pip cache on scratch ----
-VENV_DIR="/scratch/prj0000000262/ngyx/taisin/taisin-pl-py311"   # alok to change
-PIP_CACHE_DIR="/scratch/prj0000000262/ngyx/taisin/.pip_cache"   # alok to change
+VENV_DIR="/scratch/prj0000000262/ngyx/sanwa/sanwa-pl-py311"
+PIP_CACHE_DIR="/scratch/prj0000000262/ngyx/sanwa/.pip_cache"
 mkdir -p "$(dirname "$VENV_DIR")" "$PIP_CACHE_DIR"
 
-# ---- Serialize args safely ----
 EXTRA_STR=$(printf "%q " "${EXTRA_ARGS[@]}")
 
 # ---- Execute inside container ----
@@ -109,7 +119,6 @@ srun env \
   PIP_CACHE_DIR="$PIP_CACHE_DIR" \
   SCRIPT="$SCRIPT" \
   RUN_DIR="$RUN_DIR" \
-  RUN_NAME="$RUN_NAME" \
   EXTRA_STR="$EXTRA_STR" \
   "$APPTAINER_BIN" exec --nv $BIND_OPTS "$IMAGE" bash -lc '
 set -euo pipefail
@@ -129,7 +138,6 @@ export PIP_CACHE_DIR="$PIP_CACHE_DIR"
 python -m pip install --upgrade pip wheel
 pip install -r requirements.txt
 
-# Optional: make logs/checkpoints land under RUN_DIR by running from there
 mkdir -p "$RUN_DIR"
 cd "$RUN_DIR"
 
@@ -138,3 +146,4 @@ python -u "/workspace/$SCRIPT" $EXTRA_STR
 '
 
 echo "[DONE] Outputs at: $RUN_DIR"
+echo "[DONE] Checkpoints also under: $CODE_DIR/checkpoints/"

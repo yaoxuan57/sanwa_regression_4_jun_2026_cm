@@ -12,6 +12,7 @@ env/
 # Training outputs
 checkpoints/
 lightning_logs/
+tabular_dataset/
 *.pt
 *.pth
 *.ckpt
